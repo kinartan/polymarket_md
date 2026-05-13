@@ -682,10 +682,26 @@ https://data-api.polymarket.com/activity?limit=100&sortBy=TIMESTAMP&sortDirectio
 
 **Purpose**: Fetches historical PnL (Profit and Loss) time series data for a specific user. Returns data points showing cumulative PnL over time at specified intervals.
 
-**Parameters**:
-- `user_address`: Trader wallet address (required)
-- `interval`: Time range for data (options: `max`, `1y`, `6m`, `3m`, `1m`, `1w`)
-- `fidelity`: Data point granularity (options: `1d` for daily, `1h` for hourly, `15m` for 15-minute intervals)
+**Parameters** (verified by sending invalid values and reading the 400 response):
+
+- `user_address` *(required)* — proxy wallet address. Anything that doesn't
+  parse as an address returns
+  `{"error":"invalid filters: the 'user_address' field most be a valid address"}`
+  (yes, the server says "most"). Missing entirely returns
+  `{"error":"invalid filters: the 'user_address' field is mandatory"}`.
+
+- `interval` *(required)* — exactly one of:
+  `max`, `all`, `1m`, `1w`, `1d`, `12h`, `6h`.
+  Anything else returns
+  `{"error":"invalid filters: the 'interval' value is unkonwn. Known values: 'max', 'all', '1m', '1w', '1d', '12h', '6h'"}`
+  (yes, the server says "unkonwn"). **`1y`, `3m`, `6m`, `ytd` are NOT supported
+  — see "Building 1Y / YTD / ALL on the UI" below.** `max` and `all` are
+  equivalent (return the full history, identical row count).
+
+- `fidelity` *(required)* — exactly one of:
+  `1d`, `18h`, `12h`, `3h`, `1h`. Anything else (including `15m`, `5m`, `1`)
+  returns
+  `{"error":"invalid filters: the 'fidelity' value is unkonwn. Known values: '1d', '18h', '12h', '3h', '1h'"}`.
 
 **Example URL**:
 ```
@@ -716,14 +732,39 @@ https://user-pnl-api.polymarket.com/user-pnl?user_address=0x8b5a7da2fdf239b51b9c
 
 **Response Fields**:
 - `t`: Unix timestamp (integer) - Point in time for this PnL snapshot
-- `p`: PnL value (float) - Cumulative profit/loss in USD at this timestamp
+- `p`: **Cumulative PnL in USD** (signed float) at this timestamp — NOT a portfolio
+  value, NOT a daily delta. The wallet's lifetime realized + unrealized P/L up to
+  that moment, expressed as a signed dollar amount (`-2.21` = down $2.21 lifetime,
+  `+447.5` = up $447.50 lifetime).
 
 **Sample Response Characteristics**:
 - Returns array of time-series data points
 - Timestamps are Unix epoch seconds
-- PnL values are cumulative (not incremental)
+- **`p` is cumulative USD PnL — not portfolio value, not incremental**
 - Data points align with requested fidelity (e.g., daily snapshots for `1d`)
 - Typical response size: 300+ data points for `interval=max` with `fidelity=1d`
+- A bot or wallet that has only ever lost money returns a strictly negative series
+- For new wallets the series starts near `t=first_trade` — earlier requests return
+  fewer points than the nominal interval (e.g. `interval=max` on a 15-day-old
+  wallet returns ~15 daily points, not 300+)
+
+**⚠️ Pitfall: "% return" over a window is NOT `(last.p - first.p) / first.p`**
+
+Because `p` is itself a cumulative PnL (a signed delta-from-zero in dollars), not
+a portfolio value, dividing a window-delta by `first.p` produces meaningless
+numbers — especially when `first.p` is near zero. Example: a bot whose PnL
+moves from `-$2.21` to `-$109.99` is down $107.78 over the window, but the naive
+formula gives `-107.78 / 2.21 ≈ -4877%`, which is nonsense.
+
+**Honest reads of this series:**
+- **Window $ change** = `last.p - first.p` — the actual dollar PnL added during
+  the window.  Always meaningful.
+- **Lifetime $ PnL** = `last.p` — the cumulative-since-inception value at the
+  right edge.  Always meaningful.
+- **% return over window** — requires a *denominator* this API doesn't supply.
+  Use either current AUM (from `data-api.polymarket.com/value` + on-chain
+  collateral balance) or a known cost basis. The naive ratio above is wrong;
+  do not ship it on a UI.
 
 **Use Cases**:
 - Historical performance tracking for traders
@@ -731,39 +772,111 @@ https://user-pnl-api.polymarket.com/user-pnl?user_address=0x8b5a7da2fdf239b51b9c
 - Performance comparison across different time periods
 - Calculating daily/weekly/monthly returns
 
-**Interval Options**:
-- `max`: All available historical data
-- `all`: All available historical data (alias for max)
-- `1m`: Last 30 days
-- `1w`: Last 7 days
-- `1d`: Last 24 hours
-- `12h`: Last 12 hours
-- `6h`: Last 6 hours
+**Interval Options** (only these 7 are accepted server-side):
+- `max` / `all` — full history since the wallet's first activity. Identical row
+  count. **For new wallets, `max` returns only points-since-first-trade** (e.g.
+  a 15-day-old bot wallet returns ~15 daily rows, not 300+).
+- `1m` — last 30 days
+- `1w` — last 7 days
+- `1d` — last 24 hours
+- `12h` — last 12 hours
+- `6h` — last 6 hours
 
-**Fidelity Options**:
-- `1d`: Daily data points (one per day)
-- `1h`: Hourly data points (24 per day)
-- `15m`: 15-minute intervals (96 per day)
+**Fidelity Options** (only these 5 are accepted server-side):
+- `1d` — one row per day
+- `18h` — one row per 18 hours
+- `12h` — one row per 12 hours
+- `3h` — one row per 3 hours
+- `1h` — one row per hour
 
-**Example: Calculate Recent Performance**:
+**Recommended interval × fidelity pairings:**
+
+| interval | fidelity | typical row count |
+|---|---|---|
+| `6h`  | `1h` | ~6   |
+| `12h` | `1h` | ~12  |
+| `1d`  | `1h` | ~24  |
+| `1w`  | `1h` | ~168 |
+| `1m`  | `1d` | ~30  |
+| `max` | `1d` | up to ~365+ (lifetime, daily) |
+
+Mismatches don't 400 (the server happily returns `interval=max&fidelity=1h`),
+they just produce huge/unwieldy responses — pair conservatively.
+
+---
+
+#### Building `1Y` / `YTD` / `ALL` on the UI
+
+The official Polymarket UI exposes `1D / 1W / 1M / 1Y / YTD / ALL` buttons, but
+the server only accepts `1d / 1w / 1m / max`. The longer windows are built
+**client-side** by fetching `interval=max&fidelity=1d` once and filtering by
+timestamp:
+
+```typescript
+type UIRange = '1D' | '1W' | '1M' | '1Y' | 'YTD' | 'ALL';
+
+const SERVER_INTERVAL: Record<UIRange, { interval: string; fidelity: string }> = {
+  '1D':  { interval: '1d',  fidelity: '1h' },
+  '1W':  { interval: '1w',  fidelity: '1h' },
+  '1M':  { interval: '1m',  fidelity: '1d' },
+  '1Y':  { interval: 'max', fidelity: '1d' }, // filter client-side
+  'YTD': { interval: 'max', fidelity: '1d' }, // filter client-side
+  'ALL': { interval: 'max', fidelity: '1d' },
+};
+
+function windowStart(range: UIRange): number {
+  const now = Math.floor(Date.now() / 1000);
+  switch (range) {
+    case '1Y':  return now - 365 * 86400;
+    case 'YTD': return Math.floor(new Date(new Date().getUTCFullYear(), 0, 1).getTime() / 1000);
+    case 'ALL': return 0;
+    default:    return 0; // server already scoped it
+  }
+}
+
+async function fetchPnl(wallet: string, range: UIRange) {
+  const { interval, fidelity } = SERVER_INTERVAL[range];
+  const res = await fetch(
+    `https://user-pnl-api.polymarket.com/user-pnl?user_address=${wallet}` +
+    `&interval=${interval}&fidelity=${fidelity}`
+  );
+  const points: { t: number; p: number }[] = await res.json();
+  const cutoff = windowStart(range);
+  return cutoff > 0 ? points.filter(pt => pt.t >= cutoff) : points;
+}
+```
+
+For young wallets (e.g. brand-new bot wallets), `1Y` / `YTD` / `ALL` all
+collapse to the same series because the wallet doesn't have a year of data
+yet — that's expected, not a bug.
+
+**Example: 30-day PnL window (correct usage)**:
 ```typescript
 // Fetch last 30 days with daily fidelity
 const response = await fetch(
-  'https://user-pnl-api.polymarket.com/user-pnl?user_address=0x8b5a7da2fdf239b51b9c68a2a1a35bb156d200f2&interval=1m&fidelity=1d'
+  'https://user-pnl-api.polymarket.com/user-pnl?user_address=0x...&interval=1m&fidelity=1d'
 )
-const data = await response.json()
+const data: { t: number; p: number }[] = await response.json()
 
-// Calculate 30-day return
-const firstDay = data[0]
-const lastDay = data[data.length - 1]
-const monthlyReturn = lastDay.p - firstDay.p
-const monthlyReturnPercent = ((lastDay.p - firstDay.p) / firstDay.p) * 100
+const first = data[0]
+const last  = data[data.length - 1]
 
-console.log(`30-day PnL: $${monthlyReturn.toFixed(2)}`)
-console.log(`30-day Return: ${monthlyReturnPercent.toFixed(2)}%`)
+// Dollar PnL added during the window — always correct.
+const windowPnlUsd = last.p - first.p
+
+// Lifetime cumulative PnL at the right edge — always correct.
+const lifetimePnlUsd = last.p
+
+console.log(`30-day window $ PnL: ${windowPnlUsd.toFixed(2)}`)
+console.log(`Lifetime cumulative PnL: ${lifetimePnlUsd.toFixed(2)}`)
+
+// To express as a return-%, you MUST bring an outside denominator:
+//   const aum = await fetchPortfolioValue(wallet) + await fetchCollateralBalance(wallet)
+//   const returnPct = (windowPnlUsd / aum) * 100
+// DO NOT use `windowPnlUsd / first.p` — `first.p` is itself a PnL, not a base.
 ```
 
-**Note**: PnL values are cumulative totals, not daily changes. To calculate daily PnL change, subtract consecutive data points.
+**Daily PnL change**: subtract consecutive points: `data[i].p - data[i-1].p`.
 
 ### 10. CLOB Prices-History API (Outcome Token Price History)
 
@@ -1056,3 +1169,110 @@ console.log(`Gamma API price: ${gammaPrice}`); // e.g., 0.6500 (stale)
 2. Cache token IDs but never cache prices
 3. Fallback to Gamma API only if CLOB fails (log warning)
 4. After FOK fill, calculate actual entry price from fill data: `spent / shares`
+
+### 12. Portfolio Value API (Total Positions Value)
+
+**Endpoint**: `https://data-api.polymarket.com/value`
+
+**Purpose**: Fetch total current value of all active positions for a wallet. Returns a single aggregated number — much cheaper than fetching all positions and summing `currentValue`.
+
+**Usage in Polyhedge**: CAR strategy uses this to calculate the followed trader's total asset value for proportional scaling.
+
+**Parameters**:
+- `user`: Wallet address (required) — the Polymarket proxy wallet
+
+**Example Request**:
+```bash
+curl --request GET \
+  --url 'https://data-api.polymarket.com/value?user=0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b'
+```
+
+**Example Response**:
+```json
+[
+  {
+    "user": "0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b",
+    "value": 250461.06770109548
+  }
+]
+```
+
+**Response Fields**:
+- `user`: Wallet address (echo of input)
+- `value`: Total current value of all active positions in USD
+
+**Notes**:
+- Returns an array with a single element
+- Value is the sum of `currentValue` across all active positions (mark-to-market)
+- Does NOT include USDC.e wallet balance — only positions
+- Much faster than `GET /positions` + manual sum for large portfolios
+- Use alongside on-chain USDC.e balance check for total trader asset calculation
+
+**Integration in CarStrategyService**:
+```typescript
+const response = await axios.get('https://data-api.polymarket.com/value', {
+  params: { user: traderWallet }
+});
+const positionsValue = response.data?.[0]?.value || 0;
+// Add on-chain USDC.e balance for total asset
+const totalAsset = positionsValue + usdcBalance;
+```
+
+---
+
+### 13. Public Profile API (Trader Name Lookup)
+
+**Endpoint**: `https://gamma-api.polymarket.com/public-profile`
+
+**Purpose**: Fetch public profile for a Polymarket wallet address. Used to resolve trader display names when adding traders to the follow roster.
+
+**Parameters**:
+- `address`: Proxy wallet address (required)
+
+**Example Request**:
+```bash
+curl --request GET \
+  --url 'https://gamma-api.polymarket.com/public-profile?address=0x1bcb16ab3595079a8a8f0d35a475a3b71bc0b05a'
+```
+
+**Example Response**:
+```json
+{
+  "createdAt": "2025-11-03T04:07:02.234248Z",
+  "proxyWallet": "0x1bcb16ab3595079a8a8f0d35a475a3b71bc0b05a",
+  "profileImage": "https://polymarket-upload.s3.us-east-2.amazonaws.com/...",
+  "displayUsernamePublic": true,
+  "bio": "follow me on X you silly rat",
+  "pseudonym": "Dangerous-Lamb",
+  "name": "chiwawinha",
+  "xUsername": "chiiwawinha",
+  "verifiedBadge": false
+}
+```
+
+**Response Fields**:
+- `name`: Display name set by the user (preferred for trader_name)
+- `pseudonym`: Auto-generated pseudonym (fallback if name is empty)
+- `proxyWallet`: Echo of the queried wallet
+- `xUsername`: Linked X/Twitter handle
+- `profileImage`: Profile image URL
+- `bio`: User bio
+- `verifiedBadge`: Verified status
+
+**Usage in Polyhedge**:
+
+`TraderManagementController.addTrader()` auto-fetches this when `name` is not supplied in the POST body. Priority: `name` → `pseudonym` → first 10 chars of wallet.
+
+```typescript
+async function fetchTraderName(wallet: string): Promise<string> {
+  const res = await axios.get('https://gamma-api.polymarket.com/public-profile', {
+    params: { address: wallet },
+    timeout: 5000,
+  });
+  return res.data?.name || res.data?.pseudonym || wallet.slice(0, 10);
+}
+```
+
+**Error Handling**:
+- 404 or network error → fallback to truncated wallet address
+- Empty `name` field → use `pseudonym`
